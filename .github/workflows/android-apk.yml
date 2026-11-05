@@ -3,66 +3,185 @@ name: Build The Abyssal Native Android APK
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master
 
 permissions:
   contents: read
+
+concurrency:
+  group: abyssal-android-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-android:
     name: Compile Android APK
     runs-on: ubuntu-24.04
-    timeout-minutes: 50
+    timeout-minutes: 60
 
     env:
       ABYSSAL_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       ABYSSAL_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
 
     steps:
+
+      # 1. Download repository
       - name: Checkout source
         uses: actions/checkout@v7
 
+      # 2. Install Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
           node-version: 22
+          package-manager-cache: false
 
+      # 3. Install Java
       - name: Setup Java
         uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '21'
 
+      # 4. Setup Android SDK
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
+      # 5. Install Android SDK components
       - name: Install Android SDK
-        run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
-
-      - name: Install dependencies
-        run: npm install --no-audit --no-fund
-
-      - name: Verify game source
-        run: npm test
-
-      - name: Configure online services
-        run: node scripts/configure-backend.mjs
-
-      - name: Build Android project
-        run: npm run android:add
-
-      - name: Compile APK
-        run: cd android && ./gradlew --no-daemon assembleDebug
-
-      - name: Verify APK
         run: |
-          test -s android/app/build/outputs/apk/debug/app-debug.apk
-          ls -lh android/app/build/outputs/apk/debug/app-debug.apk
+          sdkmanager --install \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "platform-tools"
 
-      - name: Upload APK
+      # 6. Extract uploaded project ZIP
+      - name: Extract The Abyssal project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Searching for The Abyssal ZIP..."
+
+          mapfile -t preferred < <(
+            find "$GITHUB_WORKSPACE" \
+              -maxdepth 1 \
+              -type f \
+              -iname 'The_Abyssal_Standalone*.zip'
+          )
+
+          if [ "${#preferred[@]}" -eq 1 ]; then
+            ZIP_FILE="${preferred[0]}"
+          else
+            mapfile -t all_zips < <(
+              find "$GITHUB_WORKSPACE" \
+                -maxdepth 1 \
+                -type f \
+                -iname '*.zip'
+            )
+
+            if [ "${#all_zips[@]}" -ne 1 ]; then
+              echo "ERROR: Expected exactly one project ZIP."
+              find "$GITHUB_WORKSPACE" -maxdepth 1 -type f
+              exit 1
+            fi
+
+            ZIP_FILE="${all_zips[0]}"
+          fi
+
+          echo "Found: $ZIP_FILE"
+
+          EXTRACT_DIR="$RUNNER_TEMP/the-abyssal"
+          mkdir -p "$EXTRACT_DIR"
+
+          unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
+
+          echo "Searching for project root..."
+
+          PROJECT_DIR=""
+
+          while IFS= read -r PACKAGE_FILE; do
+            CANDIDATE="$(dirname "$PACKAGE_FILE")"
+
+            if [ -f "$CANDIDATE/index.html" ] && \
+               [ -f "$CANDIDATE/capacitor.config.json" ] && \
+               [ -f "$CANDIDATE/scripts/verify.mjs" ] && \
+               [ -f "$CANDIDATE/scripts/build-native.mjs" ]; then
+
+              PROJECT_DIR="$CANDIDATE"
+              break
+            fi
+
+          done < <(
+            find "$EXTRACT_DIR" \
+              -type f \
+              -name package.json \
+              ! -path '*/node_modules/*'
+          )
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: Valid The Abyssal project was not found."
+            find "$EXTRACT_DIR" -maxdepth 4 -type f
+            exit 1
+          fi
+
+          echo "Project directory: $PROJECT_DIR"
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Project extraction successful!"
+
+      # 7. Install project dependencies
+      - name: Install dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          npm install --no-audit --no-fund
+
+      # 8. Verify source code
+      - name: Verify game source
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          npm test
+
+      # 9. Configure Supabase
+      - name: Configure online services
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          node scripts/configure-backend.mjs
+
+      # 10. Build standalone game
+      - name: Build Android project
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          npm run android:add
+
+      # 11. Compile Android APK
+      - name: Compile APK
+        working-directory: ${{ env.PROJECT_DIR }}/android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace assembleDebug
+
+      # 12. Verify APK
+      - name: Verify APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          APK="android/app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
+          echo "APK successfully generated!"
+          ls -lh "$APK"
+
+      # 13. Upload APK
+      - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
           name: the-abyssal-android-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          path: ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30

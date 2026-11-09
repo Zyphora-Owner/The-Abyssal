@@ -1,0 +1,170 @@
+name: Build The Abyssal 4.1.0 Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: abyssal-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android:
+    name: Reassemble source, verify, and compile APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    env:
+      VITE_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+
+    steps:
+      - name: Checkout uploaded archive parts and workflow
+        uses: actions/checkout@v7.0.1
+
+      - name: Reassemble source archive and verify SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PART1="The_Abyssal_v4.1.0.zip.part01"
+          PART2="The_Abyssal_v4.1.0.zip.part02"
+          CHECKSUM_FILE="The_Abyssal_Standalone_Android_v4.1.0.zip.sha256"
+
+          test -s "$PART1"
+          test -s "$PART2"
+          test -s "$CHECKSUM_FILE"
+
+          test "$(stat -c '%s' "$PART1")" -lt 25000000
+          test "$(stat -c '%s' "$PART2")" -lt 25000000
+
+          ARCHIVE="$RUNNER_TEMP/The_Abyssal_Standalone_Android_v4.1.0.zip"
+
+          cat "$PART1" "$PART2" > "$ARCHIVE"
+
+          EXPECTED_SHA256="$(awk 'NR==1 {print $1}' "$CHECKSUM_FILE")"
+          ACTUAL_SHA256="$(sha256sum "$ARCHIVE" | cut -d ' ' -f 1)"
+
+          echo "Expected SHA-256: $EXPECTED_SHA256"
+          echo "Actual SHA-256:   $ACTUAL_SHA256"
+
+          test "$ACTUAL_SHA256" = "$EXPECTED_SHA256"
+
+          unzip -t "$ARCHIVE"
+
+          EXTRACT_DIR="$RUNNER_TEMP/the-abyssal-v4.1.0"
+          mkdir -p "$EXTRACT_DIR"
+
+          unzip -q "$ARCHIVE" -d "$EXTRACT_DIR"
+
+          test -f "$EXTRACT_DIR/package.json"
+          test -f "$EXTRACT_DIR/index.html"
+          test -f "$EXTRACT_DIR/scripts/verify.mjs"
+
+          echo "PROJECT_DIR=$EXTRACT_DIR" >> "$GITHUB_ENV"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4.0.4
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager --install \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "platform-tools"
+
+      - name: Validate optional Supabase configuration
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: node scripts/configure-backend.mjs
+
+      - name: Verify stable debug signing key
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s native/abyssal-debug-signing.bin
+
+          keytool -list \
+            -keystore native/abyssal-debug-signing.bin \
+            -storepass android \
+            -alias androiddebugkey >/dev/null
+
+      - name: Install project dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          npm install \
+            --no-audit \
+            --no-fund \
+            --fetch-retries=4 \
+            --fetch-timeout=180000
+
+      - name: Run complete source and asset verification
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: npm test
+
+      - name: Bundle game and prepare Android project
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -d android ]; then
+            npm run android:sync
+          else
+            npm run android:add
+          fi
+
+      - name: Compile debug APK
+        working-directory: ${{ env.PROJECT_DIR }}/android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Verify APK package ID and archive
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="android/app/build/outputs/apk/debug/app-debug.apk"
+
+          test -s "$APK"
+          unzip -t "$APK" >/dev/null
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_ROOT"
+
+          AAPT="$(find "$SDK_ROOT/build-tools" \
+            -type f -name aapt | sort -V | tail -n 1)"
+
+          test -n "$AAPT"
+
+          "$AAPT" dump badging "$APK" \
+            | grep -F "package: name='com.abyssal.game'"
+
+          ls -lh "$APK"
+
+      - name: Upload Android APK artifact
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: the-abyssal-android-apk-4.1.0
+          path: ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
